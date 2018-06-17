@@ -1,0 +1,250 @@
+---
+title: "2018 FIFA World Cup"
+runtime: shiny
+output: 
+  flexdashboard::flex_dashboard:
+    social: menu
+    source_code: embed
+    orientation: rows
+    vertical_layout: fill
+---
+
+```{r setup, include=FALSE}
+library(flexdashboard)
+library(tidyverse)
+library(lubridate)
+library(shiny)
+library(glue)
+
+options(scipen = 99)
+
+set.seed(1234)
+
+results <- read_csv("data/results.csv")
+matches <- read_csv("data/wc_matches.csv")
+forecast <- read_csv("data/forecasts.csv")
+
+matches <- matches %>%
+  mutate(match_string = str_c(team1, " vs ", team2))
+
+team_results <- bind_rows(
+  results %>%
+    select(date, neutral, team = home_team, goals = home_score, opponent_goals = away_score, opponent = away_team) %>%
+    mutate(
+      field = case_when(
+        neutral == TRUE ~ 0.5,
+        TRUE ~ 0
+      )
+    ),
+  results %>%
+    select(date, neutral, team = away_team, goals = away_score, opponent_goals = home_score, opponent = home_team) %>%
+    mutate(
+      field = case_when(
+        neutral == T ~ -0.5,
+        TRUE ~ 0
+      )
+    )
+) %>%
+  filter(year(date) >= 2013)
+
+team_stats <- team_results %>%
+  mutate(
+    team = case_when(
+      team == "Korea Republic" ~ "South Korea",
+      TRUE ~ team
+    ),
+    opponent = case_when(
+      opponent == "Korea Republic" ~ "South Korea",
+      TRUE ~ opponent
+    )
+  ) %>%
+  group_by(team) %>%
+  summarize(
+    goals = mean(goals),
+    conceded = mean(opponent_goals)
+  )
+
+augment_stats <- function(team1, team2) {
+  team1 <- team_stats %>%
+    filter(team == team1)
+
+  team2 <- team_stats %>%
+    filter(team == team2)
+
+  all_combinations <- tibble(
+    team1_goals = rpois(1e6, team1$goals * team2$conceded),
+    team2_goals = rpois(1e6, team2$goals * team1$conceded)
+  ) %>%
+    count(team1_goals, team2_goals) %>%
+    mutate(prob = n/sum(n)) %>%
+    select(-n)
+
+  likely_score <- all_combinations %>%
+    filter(prob == max(prob))
+
+  team1_win <- all_combinations %>%
+    filter(team1_goals > team2_goals) %>%
+    summarize_at(vars(prob), funs(team1_win = sum))
+
+  team2_win <- all_combinations %>%
+    filter(team1_goals < team2_goals) %>%
+    summarize_at(vars(prob), funs(team2_win = sum))
+
+  draw <- all_combinations %>%
+    filter(team1_goals == team2_goals) %>%
+    summarise_at(vars(prob), funs(draw = sum))
+
+  # likely_score <- str_c(likely_score$team1_goals, likely_score$team2_goals, sep = " - ")
+  return(bind_cols(likely_score, team1_win, team2_win, draw))
+}
+
+goals_distribution <- function(team1, team2) {
+  team1_stats <- team_stats %>%
+    filter(team == team1)
+  
+  team2_stats <- team_stats %>%
+    filter(team == team2)
+  
+  all_combinations <- tibble(
+    team1_goals = rpois(1e6, team1_stats$goals * team2_stats$conceded),
+    team2_goals = rpois(1e6, team2_stats$goals * team1_stats$conceded)
+  ) 
+  
+  colnames(all_combinations) <- c(team1, team2)
+  
+  return(all_combinations %>% gather(1:2, key = "team", value = "goals"))
+}
+
+# augment_stats <- function(team1, team2) {
+#   forecast %>%
+#     filter(team1 == team1 & team2 == team2)
+# }
+```
+
+Sidebar {.sidebar}
+=======================================================================
+
+```{r}
+
+inputPanel(
+    selectizeInput("Match", "Choose a Match", choices = unique(matches$match_string))
+  )
+
+team1_name <- reactive({
+  str_c(str_split(input$Match, " vs ")[[1]][1], " win chance")
+})
+
+team2_name <- reactive ({
+  str_c(str_split(input$Match, " vs ")[[1]][2], " win chance")
+})
+```
+
+Dashboard
+=======================================================================
+
+Row
+--------------------
+
+### Most Likely Score {.value-box}
+
+```{r}
+likely_score <- reactive({
+  team1 <- str_split(input$Match, " vs ")[[1]][1]
+  team2 <- str_split(input$Match, " vs ")[[1]][2]
+  
+  stats <- stats <- augment_stats(team1, team2)
+  first <- stats$team1_goals
+  second <- stats$team2_goals
+  prob <- 100*stats$prob
+  
+  glue("{first} - {second} ({prob}%)")
+})
+renderValueBox({
+  likely_score()
+})
+```
+
+### `r renderText(team1_name())` {.value-box}
+
+```{r}
+prob1 <- reactive({
+  team1 <- str_split(input$Match, " vs ")[[1]][1]
+  team2 <- str_split(input$Match, " vs ")[[1]][2]
+  
+  stats <- augment_stats(team1, team2)
+  team1_prob <- 100*stats$team1_win
+  
+  glue("{team1_prob}%")
+})
+renderValueBox({
+  valueBox(prob1())
+})
+```
+
+
+### `r renderText(team2_name())` {.value-box}
+
+```{r}
+prob2 <- reactive({
+  team1 <- str_split(input$Match, " vs ")[[1]][1]
+  team2 <- str_split(input$Match, " vs ")[[1]][2]
+  
+  stats <- augment_stats(team1, team2)
+  team2_prob <- 100*stats$team2_win
+  
+  glue("{team2_prob}%")
+})
+renderValueBox({
+  valueBox(prob2())
+})
+```
+
+### Draw chance {.value-box}
+
+```{r}
+prob3 <- reactive({
+  team1 <- str_split(input$Match, " vs ")[[1]][1]
+  team2 <- str_split(input$Match, " vs ")[[1]][2]
+  
+  stats <- augment_stats(team1, team2)
+  draw <- 100*stats$draw
+  
+  glue("{draw}%")
+})
+renderValueBox({
+  valueBox(prob3())
+})
+```
+
+Row
+-----------------------
+
+### Goals Distribution for Matches
+
+```{r}
+team1 <- reactive({
+  str_split(input$Match, " vs ")[[1]][1]
+})
+
+team2 <- reactive({
+  str_split(input$Match, " vs ")[[1]][2]
+})
+
+renderPlot({
+  goals_distribution(team1(), team2()) %>%
+    ggplot(aes(x = goals, fill = team, color = team)) +
+    geom_density() +
+    facet_wrap(~team, ncol = 1) +
+    scale_x_continuous(breaks = 0:15) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(face = "bold", size = rel(1.8), family = "Merriweather"),
+      plot.subtitle = element_text(size = rel(1.2), family = "Merriweather Light", margin = margin(0,0,20,0)),
+      text = element_text(family = "Noto Sans CJK JP Light"),
+      axis.title.x = element_text(margin = margin(20, 0, 0, 0)),
+      panel.grid.minor = element_blank(),
+      legend.position = "top"
+    )
+})
+```
+

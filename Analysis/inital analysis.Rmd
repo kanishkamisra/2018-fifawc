@@ -1,0 +1,108 @@
+---
+title: "Tidying Data"
+author: "Kanishka Misra"
+date: "June 13, 2018"
+output: pdf_document
+---
+
+```{r warning = FALSE, message=FALSE}
+library(tidyverse)
+library(lubridate)
+library(broom)
+
+set.seed(1234)
+
+results <- read_csv("data/results.csv")
+matches <- read_csv("data/wc_matches.csv")
+world_cup <- read_csv("data/WorldCupMatches.csv")
+```
+
+## Team Wise Goals
+
+```{r}
+teams <- matches %>%
+  distinct(team1)
+
+team_results <- bind_rows(
+  results %>%
+    select(date, neutral, team = home_team, goals = home_score, opponent_goals = away_score, opponent = away_team) %>%
+    mutate(
+      field = case_when(
+        neutral == T ~ 0,
+        TRUE ~ 0.5
+      )
+    ),
+  results %>%
+    select(date, neutral, team = away_team, goals = away_score, opponent_goals = home_score, opponent = home_team) %>%
+    mutate(
+      field = case_when(
+        neutral == T ~ 0,
+        TRUE ~ -0.5
+      )
+    )
+) %>%
+  filter(year(date) >= 2016) %>%
+  mutate(
+    interval = as.numeric(date %--% ymd(Sys.Date()), units = "months"),
+    weight = 1/(1 + interval),
+    weighted_goals = weight * goals
+  )
+
+team_results
+
+goals <- function(team_name) {
+  goals <- team_results %>%
+    filter(team == team_name) %>%
+    summarize_at(vars(goals), funs(mean))
+  
+  return(goals)
+}
+
+team_results %>%
+  filter(team == "France") %>%
+  summarize_at(vars(weighted_goals), funs(mean))
+
+goals("Brazil")
+
+matches %>%
+  select(team1, team2) %>%
+  mutate(
+    team1_goals = 
+  )
+```
+
+```{r}
+poisson_model <- glm(goals ~ field + team + opponent, data = team_results, family = "poisson")
+
+wc_matches <- bind_rows(
+  matches %>%
+    transmute(
+      match_id,
+      team = team1,
+      opponent = team2
+    ),
+  matches %>%
+    transmute(
+      match_id,
+      team = team2,
+      opponent = team1
+    )
+) %>%
+  mutate(
+    field = 0.5,
+    team = case_when(
+      team == "South Korea" ~ "Korea Republic",
+      TRUE ~ team
+    ),
+    opponent = case_when(
+      opponent == "South Korea" ~ "Korea Republic",
+      TRUE ~ opponent
+    )
+  )
+
+wc_matches %>%
+  group_by(match_id) %>%
+  nest() %>%
+  mutate(results = map(data, ~predict(poisson_model, .)))
+```
+
