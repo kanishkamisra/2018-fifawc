@@ -15,6 +15,7 @@ library(tidyverse)
 library(lubridate)
 library(shiny)
 library(glue)
+library(jsonlite)
 
 options(scipen = 99)
 
@@ -47,7 +48,32 @@ team_results <- bind_rows(
 ) %>%
   filter(year(date) >= 2013)
 
-team_stats <- team_results %>%
+json <- fromJSON("https://raw.githubusercontent.com/lsv/fifa-worldcup-2018/master/data.json")
+teams <- json$teams %>%
+  select(id, team = name)
+
+group_stage <- map_df(json$groups, function(x) return(x$matches)) %>%
+  as_tibble() %>%
+  filter(finished == TRUE)
+
+group_results <- bind_rows(
+  group_stage %>%
+    select(name, team_id = home_team, goals = home_result, opponent_id = away_team, opponent_goals = away_result),
+  group_stage %>%
+    select(name, team_id = away_team, goals = away_result, opponent_id = home_team, opponent_goals = home_result)
+) %>%
+  inner_join(teams, by = c(team_id = "id")) %>%
+  inner_join(teams, by = c(opponent_id = "id")) %>%
+  rename(team = "team.x", opponent = "team.y")
+
+updated_results <- bind_rows(
+  team_results %>%
+    select(team, goals, opponent, opponent_goals),
+  group_results %>%
+    select(team, goals, opponent, opponent_goals)
+)
+
+team_stats <- updated_results %>%
   mutate(
     team = case_when(
       team == "Korea Republic" ~ "South Korea",
@@ -64,51 +90,102 @@ team_stats <- team_results %>%
     conceded = mean(opponent_goals)
   )
 
+
+
+# augment_stats <- function(team1, team2) {
+#   team1 <- team_stats %>%
+#     filter(team == team1)
+# 
+#   team2 <- team_stats %>%
+#     filter(team == team2)
+# 
+#   all_combinations <- tibble(
+#     team1_goals = rpois(1e6, team1$goals * team2$conceded),
+#     team2_goals = rpois(1e6, team2$goals * team1$conceded)
+#   ) %>%
+#     count(team1_goals, team2_goals) %>%
+#     mutate(prob = n/sum(n)) %>%
+#     select(-n)
+# 
+#   likely_score <- all_combinations %>%
+#     filter(prob == max(prob))
+# 
+#   team1_win <- all_combinations %>%
+#     filter(team1_goals > team2_goals) %>%
+#     summarize_at(vars(prob), funs(team1_win = sum))
+# 
+#   team2_win <- all_combinations %>%
+#     filter(team1_goals < team2_goals) %>%
+#     summarize_at(vars(prob), funs(team2_win = sum))
+# 
+#   draw <- all_combinations %>%
+#     filter(team1_goals == team2_goals) %>%
+#     summarise_at(vars(prob), funs(draw = sum))
+# 
+#   # likely_score <- str_c(likely_score$team1_goals, likely_score$team2_goals, sep = " - ")
+#   return(bind_cols(likely_score, team1_win, team2_win, draw))
+# }
+
+poisson_model <- glm(goals ~ team + opponent, data = updated_results, family = poisson(link=log))
+
 augment_stats <- function(team1, team2) {
-  team1 <- team_stats %>%
-    filter(team == team1)
-
-  team2 <- team_stats %>%
-    filter(team == team2)
-
-  all_combinations <- tibble(
-    team1_goals = rpois(1e6, team1$goals * team2$conceded),
-    team2_goals = rpois(1e6, team2$goals * team1$conceded)
-  ) %>%
-    count(team1_goals, team2_goals) %>%
-    mutate(prob = n/sum(n)) %>%
-    select(-n)
-
+  team1_goals <- predict(poisson_model, tibble(team = team1, opponent = team2), type = "response")
+  team2_goals <- predict(poisson_model, tibble(team = team2, opponent = team1), type = "response")
+  
+  all_combinations <- dpois(0:10, team1_goals) %o% dpois(0:10, team2_goals) %>%
+    as.tibble() %>%
+    rownames_to_column("team1_goals") %>%
+    gather(V1:V11, key = "team2_goals", value = "prob") %>%
+    mutate(
+      team1_goals = as.numeric(team1_goals) - 1,
+      team2_goals = as.numeric(str_replace(team2_goals, "V", "")) - 1
+    ) 
+  
   likely_score <- all_combinations %>%
     filter(prob == max(prob))
-
+  
   team1_win <- all_combinations %>%
     filter(team1_goals > team2_goals) %>%
     summarize_at(vars(prob), funs(team1_win = sum))
-
+  
   team2_win <- all_combinations %>%
     filter(team1_goals < team2_goals) %>%
     summarize_at(vars(prob), funs(team2_win = sum))
-
+  
   draw <- all_combinations %>%
     filter(team1_goals == team2_goals) %>%
     summarise_at(vars(prob), funs(draw = sum))
-
-  # likely_score <- str_c(likely_score$team1_goals, likely_score$team2_goals, sep = " - ")
+  
   return(bind_cols(likely_score, team1_win, team2_win, draw))
 }
 
+# goals_distribution <- function(team1, team2) {
+#   team1_stats <- team_stats %>%
+#     filter(team == team1)
+#   
+#   team2_stats <- team_stats %>%
+#     filter(team == team2)
+#   
+  # all_combinations <- tibble(
+  #   team1_goals = rpois(1e6, team1_stats$goals * team2_stats$conceded),
+  #   team2_goals = rpois(1e6, team2_stats$goals * team1_stats$conceded)
+  # )
+#   
+#   colnames(all_combinations) <- c(team1, team2)
+#   
+#   return(all_combinations %>% gather(1:2, key = "team", value = "goals"))
+# }
+
+
+
 goals_distribution <- function(team1, team2) {
-  team1_stats <- team_stats %>%
-    filter(team == team1)
-  
-  team2_stats <- team_stats %>%
-    filter(team == team2)
+  team1_goals <- predict(poisson_model, tibble(team = team1, opponent = team2), type = "response")
+  team2_goals <- predict(poisson_model, tibble(team = team2, opponent = team1), type = "response")
   
   all_combinations <- tibble(
-    team1_goals = rpois(1e6, team1_stats$goals * team2_stats$conceded),
-    team2_goals = rpois(1e6, team2_stats$goals * team1_stats$conceded)
-  ) 
+    team1_goals = rpois(1e6, team1_goals),
+    team2_goals = rpois(1e6, team2_goals)
+  )
   
   colnames(all_combinations) <- c(team1, team2)
   
@@ -155,7 +232,7 @@ likely_score <- reactive({
   stats <- stats <- augment_stats(team1, team2)
   first <- stats$team1_goals
   second <- stats$team2_goals
-  prob <- 100*stats$prob
+  prob <- round(100*stats$prob, 2)
   
   glue("{first} - {second} ({prob}%)")
 })
@@ -172,7 +249,7 @@ prob1 <- reactive({
   team2 <- str_split(input$Match, " vs ")[[1]][2]
   
   stats <- augment_stats(team1, team2)
-  team1_prob <- 100*stats$team1_win
+  team1_prob <- round(100*stats$team1_win, 2)
   
   glue("{team1_prob}%")
 })
@@ -190,7 +267,7 @@ prob2 <- reactive({
   team2 <- str_split(input$Match, " vs ")[[1]][2]
   
   stats <- augment_stats(team1, team2)
-  team2_prob <- 100*stats$team2_win
+  team2_prob <- round(100*stats$team2_win, 2)
   
   glue("{team2_prob}%")
 })
@@ -207,7 +284,7 @@ prob3 <- reactive({
   team2 <- str_split(input$Match, " vs ")[[1]][2]
   
   stats <- augment_stats(team1, team2)
-  draw <- 100*stats$draw
+  draw <- round(100*stats$draw, 2)
   
   glue("{draw}%")
 })

@@ -79,16 +79,82 @@ team_stats %>%
   gather(goals, conceded, key = "stat", value = "value") %>%
   spread(team, value)
 
+library(jsonlite)
+
+json <- fromJSON("https://raw.githubusercontent.com/lsv/fifa-worldcup-2018/master/data.json")
+teams <- json$teams %>%
+  select(id, team = name, fifaCode)
+
+group_stage <- map_df(json$groups, function(x) return(x$matches)) %>%
+  as_tibble() %>%
+  filter(finished == TRUE)
+
+group_results <- bind_rows(
+  group_stage %>%
+    select(name, team_id = home_team, goals = home_result, opponent_id = away_team, opponent_goals = away_result),
+  group_stage %>%
+    select(name, team_id = away_team, goals = away_result, opponent_id = home_team, opponent_goals = home_result)
+) %>%
+  inner_join(teams, by = c(team_id = "id")) %>%
+  inner_join(teams, by = c(opponent_id = "id")) %>%
+  rename(team = "team.x", opponent = "team.y")
+
+group_stats <- group_results %>%
+  group_by(team) %>%
+  summarize(
+    goals = mean(goals),
+    conceded = mean(opponent_goals)
+  )
+
+library(rvest)
+
+rankings <- read_html("https://www.fifa.com/fifa-world-ranking/ranking-table/men/index.html") %>%
+  html_node(xpath = '//*[@id="profile"]/div[2]/table') %>%
+  html_table()
+
+rankings <- rankings[,1:6]
+
+colnames(rankings) <- c("id", "Rank", "Team", "x", "fifaCode", "points")
+
+fifa_rankings <- as.tibble(rankings) %>%
+  select(Rank, fifaCode, points) %>%
+  mutate(points = as.numeric(str_extract(points, "(?<=\\().+?(?=\\))"))) %>%
+  inner_join(teams)
+
+fifa_rankings
+
 augment_stats <- function(team1, team2) {
-  team1 <- team_stats %>%
+  
+  team1_current <- group_stats %>%
     filter(team == team1)
   
-  team2 <- team_stats %>%
+  team2_current <- group_stats %>%
     filter(team == team2)
   
+  team1_stats <- team_stats %>%
+    filter(team == team1)
+  
+  team2_stats <- team_stats %>%
+    filter(team == team2)
+  
+  team1_goals <- 0.9*team1_stats$goals + 0.1*team1_current$goals
+  team2_goals <- 0.9*team2_stats$goals + 0.1*team2_current$goals
+  
+  if(team1_current$conceded == 0) {
+    team1_conceded <- team1_stats$conceded
+  } else {
+    team1_conceded <- 0.9*team1_stats$conceded + 0.1*team1_current$conceded
+  }
+  
+  if(team2_current$conceded == 0) {
+    team2_conceded <- team2_stats$conceded
+  } else {
+    team2_conceded <- 0.9*team2_stats$conceded + 0.1*team2_current$conceded
+  }
+  
   all_combinations <- tibble(
-    team1_goals = rpois(1e6, team1$goals * team2$conceded),
-    team2_goals = rpois(1e6, team2$goals * team1$conceded)
+    team1_goals = rpois(1e6, team1_goals * team2_conceded),
+    team2_goals = rpois(1e6, team2_goals * team1_conceded)
   ) %>%
     count(team1_goals, team2_goals) %>%
     mutate(prob = n/sum(n)) %>%
@@ -114,23 +180,35 @@ augment_stats <- function(team1, team2) {
 }
 
 goals_distribution <- function(team1, team2) {
+  
+  team1_current <- group_stats %>%
+    filter(team == team1)
+  
+  team2_current <- group_stats %>%
+    filter(team == team2)
+  
   team1_stats <- team_stats %>%
     filter(team == team1)
   
   team2_stats <- team_stats %>%
     filter(team == team2)
   
+  team1_goals <- 0.8*team1_stats$goals + 0.2*team1_current$goals
+  team1_conceded <- 0.8*team1_stats$conceded + 0.2*team1_current$conceded
+  team2_goals <- 0.8*team2_stats$goals + 0.2*team2_current$goals
+  team2_conceded <- 0.8*team2_stats$conceded + 0.2*team2_current$conceded
+  
   all_combinations <- tibble(
-    team1_goals = rpois(1e6, team1_stats$goals * team2_stats$conceded),
-    team2_goals = rpois(1e6, team2_stats$goals * team1_stats$conceded)
-  ) 
+    team1_goals = rpois(1e6, team1_goals * team2_conceded),
+    team2_goals = rpois(1e6, team2_goals * team1_conceded)
+  )
   
   colnames(all_combinations) <- c(team1, team2)
   
   return(all_combinations %>% gather(1:2, key = "team", value = "goals"))
 }
 
-goals_distribution("Germany", "Mexico") %>%
+goals_distribution("Russia", "Egypt") %>%
   ggplot(aes(x = goals, fill = team, color = team)) +
   geom_density() +
   facet_wrap(~team, ncol = 1) +
@@ -163,5 +241,39 @@ matches %>%
   select(team1) %>%
   anti_join(team_stats, by = c(team1 = "team"))
 
+poisson_model <- glm(goals ~ team + opponent, data = team_results, family = poisson(link=log))
 
+augment_stats2 <- function(team1, team2) {
+  team1_goals <- predict(poisson_model, tibble(team = team1, opponent = team2), type = "response")
+  team2_goals <- predict(poisson_model, tibble(team = team2, opponent = team1), type = "response")
+  
+  all_combinations <- dpois(0:10, team1_goals) %o% dpois(0:10, team2_goals) %>%
+    as.tibble() %>%
+    rownames_to_column("team1_goals") %>%
+    gather(V1:V11, key = "team2_goals", value = "prob") %>%
+    mutate(
+      team1_goals = as.numeric(team1_goals) - 1,
+      team2_goals = as.numeric(str_replace(team2_goals, "V", "")) - 1
+    ) 
+  
+  likely_score <- all_combinations %>%
+    filter(prob == max(prob))
+  
+  team1_win <- all_combinations %>%
+    filter(team1_goals > team2_goals) %>%
+    summarize_at(vars(prob), funs(team1_win = sum))
+  
+  team2_win <- all_combinations %>%
+    filter(team1_goals < team2_goals) %>%
+    summarize_at(vars(prob), funs(team2_win = sum))
+  
+  draw <- all_combinations %>%
+    filter(team1_goals == team2_goals) %>%
+    summarise_at(vars(prob), funs(draw = sum))
+  
+  # likely_score <- str_c(likely_score$team1_goals, likely_score$team2_goals, sep = " - ")
+  return(bind_cols(likely_score, team1_win, team2_win, draw))
+}
+
+augment_stats2("Brazil", "Switzerland")
 
